@@ -1,24 +1,28 @@
 // ============================================================================
-//  Spinner Boost - mod para o Dusklight (Twilight Princess PC)
+//  Spinner Speed - mod para o Dusklight (Twilight Princess PC)
 //
-//  Enquanto Link estiver no Spinner e segurando R (giro das serras), a
-//  velocidade do Spinner aumenta PROGRESSIVAMENTE ate um limite maximo.
-//  Soltou R? A aceleracao extra vai sumindo aos poucos.
+//  Quando Link, JA EM CIMA do Spinner, ATIVA AS SERRAS (a propria checagem do
+//  jogo "ataque do Spinner" - nao importa qual botao seja), a velocidade do
+//  Spinner passa a aumentar PROGRESSIVAMENTE ate um limite maximo.
+//  Nao precisa segurar nenhum botao, e nao depende de bota.
+//  O efeito dura ate o fim daquele giro do Spinner.
 //
-//  Nao depende de bota nenhuma: so do Spinner + R.
+//  >>> Para ajustar o "feeling", mexa SO nos numeros da secao CONFIG. <<<
 //
-//  >>> Se quiser ajustar o "feeling", mexa SO nos numeros da secao CONFIG. <<<
+//  O mod escreve mensagens no log (janela Mods > Spinner Speed > Logs) para
+//  ajudar a descobrir se algo nao funcionar.
 // ============================================================================
 
 // IMPORTANTE: a ORDEM dos includes importa (principalmente no Windows/MSVC):
-//   1) bibliotecas padrao do C++ primeiro (os headers do jogo redefinem coisas
-//      que quebram a biblioteca da Microsoft se ela for carregada depois);
+//   1) bibliotecas padrao do C++ primeiro;
 //   2) headers do SDK de mods;
-//   3) por ultimo, os headers do jogo, na ordem que o proprio jogo usa.
+//   3) por ultimo, os headers do jogo.
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -40,72 +44,121 @@
 #include "d/dolzel.h"
 #endif
 #include "d/d_com_inf_game.h"
-#include "d/actor/d_a_spinner.h"          // classe daSpinner_c
-#include "m_Do/m_Do_controller_pad.h"     // leitura do controle (botao R)
+#include "d/actor/d_a_spinner.h"   // classe daSpinner_c
+#include "d/actor/d_a_alink.h"     // classe daAlink_c (Link)
 
 DEFINE_MOD();                               // uma vez so, neste arquivo
 IMPORT_SERVICE(LogService, svc_log);
 IMPORT_SERVICE(HookService, svc_hook);
 
-// Diz ao Dusklight qual funcao do jogo vamos "espiar":
-// daSpinner_c::posMove = o passo de movimento do Spinner (roda 1x por tick).
+// Funcoes do jogo que vamos "espiar":
+//  - daSpinner_c::posMove      : movimento do Spinner (1x por tick)
+//  - daAlink_c::procSpinnerWait: Link andando no Spinner (1x por tick)
 DEFINE_HOOK(&daSpinner_c::posMove, SpinnerPosMove);
+DEFINE_HOOK(&daAlink_c::procSpinnerWait, LinkSpinnerWait);
 
 // ----------------------------------------------------------------------------
 //  CONFIG  (pode editar a vontade)
 // ----------------------------------------------------------------------------
 namespace {
 
-// Multiplicador maximo de velocidade. 1.0 = vanilla, 2.0 = o dobro.
+// Multiplicador maximo de velocidade. 1.0 = normal, 2.0 = o dobro.
 constexpr float kMaxMultiplier = 2.0f;
 
-// Teto ABSOLUTO de velocidade (unidades por tick). O Spinner vanilla anda
-// ~26 na maioria dos lugares. Com 48 voce fica ~85% mais rapido que o normal,
-// mas nao vira um foguete. (O cheat "Fast Spinner" do proprio Dusklight limita em 60.)
+// Teto ABSOLUTO de velocidade (unidades por tick). O Spinner normal anda ~26.
+// (O cheat "Fast Spinner" do Dusklight limita em 60.)
 constexpr float kSpeedCap = 48.0f;
 
-// Quanto o multiplicador sobe por tick enquanto R esta apertado.
-// O jogo roda a 30 ticks/s: 0.02 => ~50 ticks (~1,7 s) para sair de 1.0 a 2.0.
-constexpr float kRampPerTick = 0.02f;
-
-// Quanto o multiplicador cai por tick quando solta R (mais rapido que subir).
-constexpr float kDecayPerTick = 0.05f;
+// Quanto o multiplicador sobe por tick depois de ativar (30 ticks = 1 segundo).
+// 0.04 => ~25 ticks (menos de 1 s) para ir de 1.0 ate 2.0.
+constexpr float kRampPerTick = 0.04f;
 
 // ----------------------------------------------------------------------------
 //  Estado interno (nao precisa mexer)
 // ----------------------------------------------------------------------------
+using Clock = std::chrono::steady_clock;
+
+bool g_active = false;                // serras foram ativadas neste giro?
+bool g_prevAttack = false;            // valor anterior do "ataque do Spinner"
+bool g_firstSample = true;            // primeira leitura deste giro?
 float g_boost = 1.0f;                 // multiplicador atual (1.0 .. kMaxMultiplier)
-float g_appliedFactor = 1.0f;         // fator aplicado neste tick (para desfazer no post-hook)
+float g_appliedFactor = 1.0f;         // fator aplicado neste tick (desfeito no post-hook)
 const daSpinner_c* g_lastSpinner = nullptr;
+Clock::time_point g_lastWait{};       // ultima vez que Link esteve "no Spinner"
+bool g_loggedFirstWait = false;
+bool g_loggedFirstMove = false;
+int g_logTick = 0;
+
+void logf(const char* fmt, double a = 0, double b = 0, double c = 0) {
+    char buf[200];
+    std::snprintf(buf, sizeof(buf), fmt, a, b, c);
+    svc_log->info(mod_ctx, buf);
+}
 
 float clampf(float v, float lo, float hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-// Roda ANTES do movimento do Spinner.
-HookAction on_spinner_move_pre(ModContext*, void* args, void*, void*) {
-    daSpinner_c* spinner = mods::arg<daSpinner_c*>(args, 0);   // arg 0 = "this"
-    if (spinner == nullptr) {
-        g_appliedFactor = 1.0f;
-        return HOOK_CONTINUE;
+// Roda ANTES de cada tick em que Link esta no Spinner.
+// Aqui detectamos a ativacao das serras.
+HookAction on_link_spinner_wait_pre(ModContext*, void* args, void*, void*) {
+    daAlink_c* link = mods::arg<daAlink_c*>(args, 0);   // arg 0 = "this"
+    if (link == nullptr) return HOOK_CONTINUE;
+
+    if (!g_loggedFirstWait) {
+        g_loggedFirstWait = true;
+        svc_log->info(mod_ctx, "Link esta no Spinner (hook procSpinnerWait funcionando)");
     }
 
-    // Spinner novo (acabou de subir nele)? Comeca do zero.
-    if (spinner != g_lastSpinner) {
-        g_lastSpinner = spinner;
+    const auto now = Clock::now();
+    const double since = std::chrono::duration<double>(now - g_lastWait).count();
+    daSpinner_c* spinner = link->getSpinnerActor();
+
+    // Giro novo (passou mais de 1s sem estar no Spinner, ou outro Spinner)?
+    if (since > 1.0 || spinner != g_lastSpinner) {
+        g_active = false;
         g_boost = 1.0f;
+        g_lastSpinner = spinner;
+        g_logTick = 0;
+        g_firstSample = true;
+        svc_log->info(mod_ctx, "Novo giro de Spinner: aguardando ativar as serras");
+    }
+    g_lastWait = now;
+
+    // Checagem do proprio jogo: "as serras / o ataque do Spinner foi acionado?"
+    const bool attack = link->checkSpinnerTriggerAttack();
+
+    if (g_firstSample) {
+        // Primeira leitura do giro = referencia (ignora o aperto de subir no Spinner).
+        g_firstSample = false;
+        g_prevAttack = attack;
+    } else if (attack != g_prevAttack) {
+        logf("Checagem de ataque do Spinner mudou para %.0f", attack ? 1.0 : 0.0);
+        g_prevAttack = attack;
+        // Passou de desligado para ligado => serras ativadas.
+        if (attack && !g_active) {
+            g_active = true;
+            svc_log->info(mod_ctx, "Serras ativadas! Boost progressivo iniciado");
+        }
+    }
+    return HOOK_CONTINUE;
+}
+
+// Roda ANTES do movimento do Spinner (1x por tick).
+HookAction on_spinner_move_pre(ModContext*, void* args, void*, void*) {
+    daSpinner_c* spinner = mods::arg<daSpinner_c*>(args, 0);
+    g_appliedFactor = 1.0f;
+    if (spinner == nullptr) return HOOK_CONTINUE;
+
+    if (!g_loggedFirstMove) {
+        g_loggedFirstMove = true;
+        svc_log->info(mod_ctx, "Movimento do Spinner detectado (hook posMove funcionando)");
     }
 
-    // R segurado = serras girando.
-    const bool sawsSpinning = mDoCPd_c::getHoldR(PAD_1) != 0;
+    if (!g_active) return HOOK_CONTINUE;
 
-    if (sawsSpinning) {
-        g_boost = clampf(g_boost + kRampPerTick, 1.0f, kMaxMultiplier);
-    } else {
-        g_boost = clampf(g_boost - kDecayPerTick, 1.0f, kMaxMultiplier);
-    }
+    g_boost = clampf(g_boost + kRampPerTick, 1.0f, kMaxMultiplier);
 
-    // Calcula o fator final respeitando o teto absoluto.
     const float base = spinner->speedF;
     float factor = 1.0f;
     if (base > 0.0f && base < kSpeedCap) {
@@ -113,15 +166,20 @@ HookAction on_spinner_move_pre(ModContext*, void* args, void*, void*) {
         if (wanted > kSpeedCap) wanted = kSpeedCap;
         factor = wanted / base;
     }
-    // (Se o Spinner ja esta mais rapido que o teto, ex.: trilhos rapidos, nao mexemos.)
+    // (Se o Spinner ja esta acima do teto, ex.: trilhos rapidos, nao mexemos.)
 
     g_appliedFactor = factor;
     spinner->speedF = base * factor;
+
+    if ((g_logTick++ % 15) == 0) {
+        logf("Boost: multiplicador %.2f, velocidade %.1f -> %.1f",
+             g_boost, base, base * factor);
+    }
     return HOOK_CONTINUE;
 }
 
-// Roda DEPOIS do movimento: desfaz o fator, para a desaceleracao natural
-// do Spinner continuar funcionando normalmente.
+// Roda DEPOIS do movimento: desfaz o fator para a desaceleracao natural
+// do Spinner continuar funcionando.
 void on_spinner_move_post(ModContext*, void* args, void*, void*) {
     daSpinner_c* spinner = mods::arg<daSpinner_c*>(args, 0);
     if (spinner != nullptr && g_appliedFactor > 0.0f && g_appliedFactor != 1.0f) {
@@ -135,14 +193,20 @@ void on_spinner_move_post(ModContext*, void* args, void*, void*) {
 extern "C" {
 
 MOD_EXPORT ModResult mod_initialize(ModError* error) {
+    g_active = false;
+    g_prevAttack = false;
+    g_firstSample = true;
     g_boost = 1.0f;
     g_appliedFactor = 1.0f;
     g_lastSpinner = nullptr;
+    g_loggedFirstWait = false;
+    g_loggedFirstMove = false;
 
+    mods::hook::add_pre<LinkSpinnerWait>(on_link_spinner_wait_pre);
     mods::hook::add_pre<SpinnerPosMove>(on_spinner_move_pre);
     mods::hook::add_post<SpinnerPosMove>(on_spinner_move_post);
 
-    svc_log->info(mod_ctx, "Spinner Boost carregado!");
+    svc_log->info(mod_ctx, "Spinner Speed carregado!");
     return MOD_OK;
 }
 
@@ -151,7 +215,6 @@ MOD_EXPORT ModResult mod_update(ModError* error) {
 }
 
 MOD_EXPORT ModResult mod_shutdown(ModError* error) {
-    // O Dusklight remove os hooks sozinho ao desativar o mod.
     return MOD_OK;
 }
 
