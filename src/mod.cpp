@@ -62,11 +62,11 @@ namespace {
 
 // TETO de velocidade (unidades por tick). O Spinner normal anda ~26.
 // (O cheat "Fast Spinner" do Dusklight limita em 60.)
-constexpr float kSpeedCap = 45.0f;
+constexpr float kSpeedCap = 90.0f;
 
 // Quanto a velocidade AUMENTA por tick enquanto o boost esta ativo.
-// O jogo roda a 30 ticks por segundo: 0.8 => sai de 26 e chega ao teto em ~0,8 s.
-constexpr float kAccelPerTick = 0.8f;
+// O jogo roda a 30 ticks por segundo: 1.6 => sai de 26 e chega ao teto em ~1,3 s.
+constexpr float kAccelPerTick = 1.6f;
 
 // Duracao do boost a cada ativacao das serras, em ticks (30 = 1 segundo).
 // Apertar de novo durante o boost renova esse tempo.
