@@ -7,8 +7,16 @@ endif ()
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/FetchDusklight.cmake")
 add_subdirectory("${DUSKLIGHT_DIR}/sdk" dusklight-sdk EXCLUDE_FROM_ALL)
 
-configure_file("${CMAKE_CURRENT_SOURCE_DIR}/mod.json.in"
-               "${CMAKE_CURRENT_BINARY_DIR}/mod.json" @ONLY)
+# O mod.json e gerado aqui (sempre com quebras de linha LF) para ficar
+# byte a byte identico em todas as plataformas, senao o "Combine bundles" falha.
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/mod.json" [=[{
+  "id": "dev.spinner_speed",
+  "name": "Spinner Speed",
+  "version": "1.0.0",
+  "author": "Spinner Speed",
+  "description": "O Spinner acelera progressivamente enquanto R (giro das serras) esta pressionado, ate um limite maximo."
+}
+]=])
 
 add_mod(spinner_speed
         FEATURES game
