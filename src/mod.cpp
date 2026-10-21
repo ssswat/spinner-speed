@@ -65,12 +65,12 @@ namespace {
 constexpr float kSpeedCap = 90.0f;
 
 // Quanto a velocidade AUMENTA por tick enquanto o boost esta ativo.
-// O jogo roda a 30 ticks por segundo: 1.6 => sai de 26 e chega ao teto em ~1,3 s.
-constexpr float kAccelPerTick = 1.6f;
+// O jogo roda a 30 ticks por segundo: 0.9 => precisa de varios ataques seguidos para chegar ao teto (~3-4 s).
+constexpr float kAccelPerTick = 0.9f;
 
 // Duracao do boost a cada ativacao das serras, em ticks (30 = 1 segundo).
 // Apertar de novo durante o boost renova esse tempo.
-constexpr int kBoostTicks = 36;
+constexpr int kBoostTicks = 24;
 
 // Abaixo desta velocidade o Spinner ja esta "morrendo": nao damos boost
 // (evita ressuscitar um giro que acabou).
