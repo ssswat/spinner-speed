@@ -10,9 +10,30 @@
 //  >>> Se quiser ajustar o "feeling", mexa SO nos numeros da secao CONFIG. <<<
 // ============================================================================
 
-// IMPORTANTE: a ORDEM dos includes importa. Os headers do jogo precisam vir
-// primeiro e na ordem que os arquivos do proprio jogo usam (cabecalho "pre-compilado"
-// do jogo antes de qualquer outro header do jogo).
+// IMPORTANTE: a ORDEM dos includes importa (principalmente no Windows/MSVC):
+//   1) bibliotecas padrao do C++ primeiro (os headers do jogo redefinem coisas
+//      que quebram a biblioteca da Microsoft se ela for carregada depois);
+//   2) headers do SDK de mods;
+//   3) por ultimo, os headers do jogo, na ordem que o proprio jogo usa.
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <functional>
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include "mods/service.hpp"
+#include "mods/svc/log.h"
+#include "mods/svc/hook.hpp"
+
 #if __has_include("d/dolzel_rel.h")
 #include "d/dolzel_rel.h"
 #elif __has_include("d/dolzel.h")
@@ -21,10 +42,6 @@
 #include "d/d_com_inf_game.h"
 #include "d/actor/d_a_spinner.h"          // classe daSpinner_c
 #include "m_Do/m_Do_controller_pad.h"     // leitura do controle (botao R)
-
-#include "mods/service.hpp"
-#include "mods/svc/log.h"
-#include "mods/svc/hook.hpp"
 
 DEFINE_MOD();                               // uma vez so, neste arquivo
 IMPORT_SERVICE(LogService, svc_log);
