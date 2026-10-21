@@ -10,12 +10,21 @@
 //  >>> Se quiser ajustar o "feeling", mexa SO nos numeros da secao CONFIG. <<<
 // ============================================================================
 
+// IMPORTANTE: a ORDEM dos includes importa. Os headers do jogo precisam vir
+// primeiro e na ordem que os arquivos do proprio jogo usam (cabecalho "pre-compilado"
+// do jogo antes de qualquer outro header do jogo).
+#if __has_include("d/dolzel_rel.h")
+#include "d/dolzel_rel.h"
+#elif __has_include("d/dolzel.h")
+#include "d/dolzel.h"
+#endif
+#include "d/d_com_inf_game.h"
+#include "d/actor/d_a_spinner.h"          // classe daSpinner_c
+#include "m_Do/m_Do_controller_pad.h"     // leitura do controle (botao R)
+
 #include "mods/service.hpp"
 #include "mods/svc/log.h"
 #include "mods/svc/hook.hpp"
-
-#include "d/actor/d_a_spinner.h"          // classe daSpinner_c
-#include "m_Do/m_Do_controller_pad.h"     // leitura do controle (botao R)
 
 DEFINE_MOD();                               // uma vez so, neste arquivo
 IMPORT_SERVICE(LogService, svc_log);
