@@ -1,7 +1,7 @@
 {
-  "id": "com.example.my_mod",
-  "name": "My Mod",
-  "version": "@PROJECT_VERSION@",
-  "author": "You",
-  "description": "An example Dusklight mod"
+  "id": "dev.spinner_speed",
+  "name": "Spinner Speed",
+  "version": "1.0.0",
+  "author": "Spinner Speed",
+  "description": "O Spinner acelera progressivamente enquanto R (giro das serras) esta pressionado, ate um limite maximo."
 }
