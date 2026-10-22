@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -47,6 +48,7 @@
 #include "d/d_com_inf_game.h"
 #include "d/actor/d_a_spinner.h"   // classe daSpinner_c
 #include "d/actor/d_a_alink.h"     // classe daAlink_c (Link)
+#include "m_Do/m_Do_controller_pad.h"  // leitura do analogico (so para o diagnostico)
 
 DEFINE_MOD();                               // uma vez so, neste arquivo
 IMPORT_SERVICE(LogService, svc_log);
@@ -119,6 +121,44 @@ int read_cfg_int(ConfigVarHandle var, int fallback, int lo, int hi) {
 float max_speed() { return static_cast<float>(read_cfg_int(g_varMaxSpeed, kDefaultMaxSpeed, 30, 300)); }
 float step_per_attack() { return static_cast<float>(read_cfg_int(g_varStep, kDefaultStepPerAttack, 1, 60)); }
 
+// ----------------------------------------------------------------------------
+//  DIAGNOSTICO (versao de teste): registra no log como direcao e velocidade
+//  mudam, para descobrirmos o que controla a curva e a frenagem do Spinner.
+// ----------------------------------------------------------------------------
+void log_fmt(const char* fmt, ...) {
+    char buf[320];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    svc_log->info(mod_ctx, buf);
+}
+
+struct StickRead { float x = 0.0f; float y = 0.0f; bool ok = false; };
+
+// Le o analogico se a funcao existir no jogo (nao quebra a compilacao se nao existir).
+template <class Pad>
+StickRead read_stick() {
+    StickRead r;
+    if constexpr (requires { Pad::getStickX3D(0); Pad::getStickY3D(0); }) {
+        r.x = static_cast<float>(Pad::getStickX3D(0));
+        r.y = static_cast<float>(Pad::getStickY3D(0));
+        r.ok = true;
+    } else if constexpr (requires { Pad::getStickX(0); Pad::getStickY(0); }) {
+        r.x = static_cast<float>(Pad::getStickX(0));
+        r.y = static_cast<float>(Pad::getStickY(0));
+        r.ok = true;
+    }
+    return r;
+}
+
+int g_diagTick = 0;
+bool g_diagHavePost = false;
+int g_preCur = 0, g_preShape = 0, g_preGet = 0;
+float g_preSpeed = 0.0f;
+int g_postCur = 0, g_postShape = 0;
+float g_postSpeed = 0.0f;
+
 // Roda ANTES de cada tick em que Link esta no Spinner.
 // Aqui detectamos a ativacao das serras.
 HookAction on_link_spinner_wait_pre(ModContext*, void* args, void*, void*) {
@@ -181,6 +221,12 @@ HookAction on_spinner_move_pre(ModContext*, void* args, void*, void*) {
         svc_log->info(mod_ctx, "Movimento do Spinner detectado (hook posMove funcionando)");
     }
 
+    // --- diagnostico: estado antes do movimento ---
+    g_preCur = static_cast<int>(spinner->current.angle.y);
+    g_preShape = static_cast<int>(spinner->shape_angle.y);
+    g_preGet = static_cast<int>(spinner->getAngleY());
+    g_preSpeed = spinner->speedF;
+
     if (g_holdTicks <= 0) {
         g_target = 0.0f;   // acabou o periodo: proximo ataque parte da velocidade real
         return HOOK_CONTINUE;
@@ -204,6 +250,40 @@ HookAction on_spinner_move_pre(ModContext*, void* args, void*, void*) {
         }
     }
     return HOOK_CONTINUE;
+}
+
+// Roda DEPOIS do movimento do Spinner: compara com o estado de antes (diagnostico).
+void on_spinner_move_post(ModContext*, void* args, void*, void*) {
+    daSpinner_c* spinner = mods::arg<daSpinner_c*>(args, 0);
+    if (spinner == nullptr) return;
+
+    const int postCur = static_cast<int>(spinner->current.angle.y);
+    const int postShape = static_cast<int>(spinner->shape_angle.y);
+    const float postSpeed = spinner->speedF;
+
+    if (spinner->speedF > 0.5f && (g_diagTick++ % 6) == 0) {
+        // "dentro" = mudou DENTRO do movimento do Spinner; "fora" = mudou ENTRE um tick e outro
+        // (por exemplo, pelo codigo do Link). Angulos em unidades do jogo (65536 = volta inteira).
+        const int inCur = static_cast<int16_t>(postCur - g_preCur);
+        const int inShape = static_cast<int16_t>(postShape - g_preShape);
+        int outCur = 0, outShape = 0;
+        float outSpeed = 0.0f;
+        if (g_diagHavePost) {
+            outCur = static_cast<int16_t>(g_preCur - g_postCur);
+            outShape = static_cast<int16_t>(g_preShape - g_postShape);
+            outSpeed = g_preSpeed - g_postSpeed;
+        }
+        const StickRead st = read_stick<mDoCPd_c>();
+        log_fmt("DIAG vel=%.1f | dentro: cur%+d shape%+d vel%+.2f | fora: cur%+d shape%+d vel%+.2f | ang cur=%d shape=%d get=%d | stick %s %.2f,%.2f",
+                g_preSpeed, inCur, inShape, postSpeed - g_preSpeed,
+                outCur, outShape, outSpeed,
+                postCur, postShape, g_preGet,
+                st.ok ? "ok" : "indisp.", st.x, st.y);
+    }
+    g_postCur = postCur;
+    g_postShape = postShape;
+    g_postSpeed = postSpeed;
+    g_diagHavePost = true;
 }
 
 // Painel do mod na janela Mods: as duas opcoes ajustaveis.
@@ -247,6 +327,8 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     g_lastSpinner = nullptr;
     g_loggedFirstWait = false;
     g_loggedFirstMove = false;
+    g_diagHavePost = false;
+    g_diagTick = 0;
 
     // Opcoes salvas no config do Dusklight.
     ConfigVarDesc maxDesc = CONFIG_VAR_DESC_INIT;
@@ -278,8 +360,9 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
 
     mods::hook::add_pre<LinkSpinnerWait>(on_link_spinner_wait_pre);
     mods::hook::add_pre<SpinnerPosMove>(on_spinner_move_pre);
+    mods::hook::add_post<SpinnerPosMove>(on_spinner_move_post);
 
-    svc_log->info(mod_ctx, "Spinner Speed carregado!");
+    svc_log->info(mod_ctx, "Spinner Speed carregado! (versao com DIAGNOSTICO de direcao/frenagem)");
     return MOD_OK;
 }
 

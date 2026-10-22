@@ -16,4 +16,5 @@ add_mod(spinner_speed
         FEATURES game
         SOURCES src/mod.cpp
         MOD_JSON "${CMAKE_CURRENT_BINARY_DIR}/mod.json"
+        RES_DIR res
 )
