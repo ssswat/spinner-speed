@@ -1,15 +1,17 @@
 // ============================================================================
 //  Spinner Speed - mod para o Dusklight (Twilight Princess PC)
 //
-//  Cada vez que Link, em cima do Spinner, ATIVA AS SERRAS (a propria checagem
-//  do jogo "ataque do Spinner"), o Spinner ganha um pouco de velocidade.
-//  Atacar varias vezes seguidas vai somando, ate a VELOCIDADE MAXIMA.
+//  1) BOOST: cada vez que Link, em cima do Spinner, ATIVA AS SERRAS, o Spinner
+//     ganha velocidade. Atacar varias vezes seguidas soma, ate o maximo.
+//  2) CURVA: o Spinner vira mais rapido (reforca a curva do proprio jogo).
+//     A frenagem continua como no jogo original.
 //
-//  Duas opcoes ajustaveis DENTRO DO JOGO (janela Mods > Spinner Speed):
+//  Opcoes ajustaveis DENTRO DO JOGO (janela Mods > Spinner Speed):
 //    - Velocidade maxima
-//    - Ganho de velocidade por ataque
+//    - Ganho de velocidade por ataque de serra
+//    - Curva (100 = normal do jogo)
 //
-//  O mod tambem escreve no log (janela Mods > Spinner Speed > Logs).
+//  O mod escreve eventos no log (janela Mods > Spinner Speed > Logs).
 // ============================================================================
 
 // IMPORTANTE: a ORDEM dos includes importa (principalmente no Windows/MSVC):
@@ -21,7 +23,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -48,7 +49,6 @@
 #include "d/d_com_inf_game.h"
 #include "d/actor/d_a_spinner.h"   // classe daSpinner_c
 #include "d/actor/d_a_alink.h"     // classe daAlink_c (Link)
-#include "m_Do/m_Do_controller_pad.h"  // leitura do analogico (so para o diagnostico)
 
 DEFINE_MOD();                               // uma vez so, neste arquivo
 IMPORT_SERVICE(LogService, svc_log);
@@ -101,7 +101,6 @@ const daSpinner_c* g_lastSpinner = nullptr;
 Clock::time_point g_lastWait{};       // ultima vez que Link esteve "no Spinner"
 bool g_loggedFirstWait = false;
 bool g_loggedFirstMove = false;
-int g_logTick = 0;
 
 void log_msg(const char* fmt, double a = 0, double b = 0, double c = 0) {
     char buf[200];
@@ -124,47 +123,12 @@ float max_speed() { return static_cast<float>(read_cfg_int(g_varMaxSpeed, kDefau
 int turn_percent() { return read_cfg_int(g_varTurn, 300, 100, 800); }
 float step_per_attack() { return static_cast<float>(read_cfg_int(g_varStep, kDefaultStepPerAttack, 1, 60)); }
 
-// ----------------------------------------------------------------------------
-//  DIAGNOSTICO (versao de teste): registra no log como direcao e velocidade
-//  mudam, para descobrirmos o que controla a curva e a frenagem do Spinner.
-// ----------------------------------------------------------------------------
-void log_fmt(const char* fmt, ...) {
-    char buf[320];
-    va_list ap;
-    va_start(ap, fmt);
-    std::vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    svc_log->info(mod_ctx, buf);
-}
-
-struct StickRead { float x = 0.0f; float y = 0.0f; bool ok = false; };
-
-// Le o analogico se a funcao existir no jogo (nao quebra a compilacao se nao existir).
-template <class Pad>
-StickRead read_stick() {
-    StickRead r;
-    if constexpr (requires { Pad::getStickX3D(0); Pad::getStickY3D(0); }) {
-        r.x = static_cast<float>(Pad::getStickX3D(0));
-        r.y = static_cast<float>(Pad::getStickY3D(0));
-        r.ok = true;
-    } else if constexpr (requires { Pad::getStickX(0); Pad::getStickY(0); }) {
-        r.x = static_cast<float>(Pad::getStickX(0));
-        r.y = static_cast<float>(Pad::getStickY(0));
-        r.ok = true;
-    }
-    return r;
-}
-
-int g_diagTick = 0;
 daAlink_c* g_link = nullptr;      // Link (guardado no hook procSpinnerWait)
 int g_lastD = 0;                  // ultima mudanca de angulo feita pelo jogo (1 tick)
 int g_noAssistTicks = 0;          // pausa do reforco de curva (anti-oscilacao)
-int g_extraApplied = 0;           // reforco aplicado neste tick (so para o log)
-bool g_diagHavePost = false;
-int g_preCur = 0, g_preShape = 0, g_preGet = 0;
-float g_preSpeed = 0.0f;
-int g_postCur = 0, g_postShape = 0;
-float g_postSpeed = 0.0f;
+bool g_havePost = false;
+int g_preCur = 0;    // angulo do Spinner no inicio do tick
+int g_postCur = 0;   // angulo do Spinner no fim do tick anterior
 
 // Roda ANTES de cada tick em que Link esta no Spinner.
 // Aqui detectamos a ativacao das serras.
@@ -187,9 +151,8 @@ HookAction on_link_spinner_wait_pre(ModContext*, void* args, void*, void*) {
         g_target = 0.0f;
         g_holdTicks = 0;
         g_lastSpinner = spinner;
-        g_logTick = 0;
         g_firstSample = true;
-        g_diagHavePost = false;   // nao compara com o giro anterior
+        g_havePost = false;   // nao compara com o giro anterior
         g_lastD = 0;
         g_noAssistTicks = 0;
         svc_log->info(mod_ctx, "Novo giro de Spinner: aguardando ativar as serras");
@@ -232,20 +195,14 @@ HookAction on_spinner_move_pre(ModContext*, void* args, void*, void*) {
         svc_log->info(mod_ctx, "Movimento do Spinner detectado (hook posMove funcionando)");
     }
 
-    // --- diagnostico: estado antes do movimento ---
     g_preCur = static_cast<int>(spinner->current.angle.y);
-    g_preShape = static_cast<int>(spinner->shape_angle.y);
-    g_preGet = static_cast<int>(spinner->getAngleY());
-    g_preSpeed = spinner->speedF;
 
     // ------------------------------------------------------------------
     //  CURVA MAIS LIVRE: o jogo gira o Spinner ate 360 unidades por tick.
     //  Medimos quanto o jogo girou neste tick e somamos um reforco na
     //  mesma direcao (curva_percent/100 vezes mais rapido).
     // ------------------------------------------------------------------
-    g_extraApplied = 0;
-
-    if (g_diagHavePost) {
+    if (g_havePost) {
         const int d = static_cast<int16_t>(g_preCur - g_postCur);   // girada pelo jogo neste tick
         if (d != 0) {
             // Mudou de sentido? Provavel ultrapassagem do alvo: pausa o reforco um instante.
@@ -266,7 +223,6 @@ HookAction on_spinner_move_pre(ModContext*, void* args, void*, void*) {
                     g_link->current.angle.y = static_cast<int16_t>(g_link->current.angle.y + extra);
                     g_link->shape_angle.y = static_cast<int16_t>(g_link->shape_angle.y + extra);
                 }
-                g_extraApplied = extra;
             }
         }
     }
@@ -289,45 +245,17 @@ HookAction on_spinner_move_pre(ModContext*, void* args, void*, void*) {
         if (after > g_target) after = g_target;
         spinner->speedF = after;
 
-        if ((g_logTick++ % 10) == 0) {
-            log_msg("Boost: velocidade %.1f -> %.1f (alvo %.1f)", before, after, g_target);
-        }
     }
     return HOOK_CONTINUE;
 }
 
-// Roda DEPOIS do movimento do Spinner: compara com o estado de antes (diagnostico).
+// Roda DEPOIS do movimento do Spinner: guarda o angulo final deste tick,
+// para medirmos no proximo tick quanto o jogo girou o Spinner.
 void on_spinner_move_post(ModContext*, void* args, void*, void*) {
     daSpinner_c* spinner = mods::arg<daSpinner_c*>(args, 0);
     if (spinner == nullptr) return;
-
-    const int postCur = static_cast<int>(spinner->current.angle.y);
-    const int postShape = static_cast<int>(spinner->shape_angle.y);
-    const float postSpeed = spinner->speedF;
-
-    if (spinner->speedF > 0.5f && (g_diagTick++ % 6) == 0) {
-        // "dentro" = mudou DENTRO do movimento do Spinner; "fora" = mudou ENTRE um tick e outro
-        // (por exemplo, pelo codigo do Link). Angulos em unidades do jogo (65536 = volta inteira).
-        const int inCur = static_cast<int16_t>(postCur - g_preCur);
-        const int inShape = static_cast<int16_t>(postShape - g_preShape);
-        int outCur = 0, outShape = 0;
-        float outSpeed = 0.0f;
-        if (g_diagHavePost) {
-            outCur = static_cast<int16_t>(g_preCur - g_postCur);
-            outShape = static_cast<int16_t>(g_preShape - g_postShape);
-            outSpeed = g_preSpeed - g_postSpeed;
-        }
-        const StickRead st = read_stick<mDoCPd_c>();
-        log_fmt("DIAG vel=%.1f | dentro: cur%+d shape%+d vel%+.2f | fora: cur%+d shape%+d vel%+.2f | ang cur=%d shape=%d get=%d | stick %s %.2f,%.2f | reforco %+d",
-                g_preSpeed, inCur, inShape, postSpeed - g_preSpeed,
-                outCur, outShape, outSpeed,
-                postCur, postShape, g_preGet,
-                st.ok ? "ok" : "indisp.", st.x, st.y, g_extraApplied);
-    }
-    g_postCur = postCur;
-    g_postShape = postShape;
-    g_postSpeed = postSpeed;
-    g_diagHavePost = true;
+    g_postCur = static_cast<int>(spinner->current.angle.y);
+    g_havePost = true;
 }
 
 // Painel do mod na janela Mods: as duas opcoes ajustaveis.
@@ -382,8 +310,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     g_lastSpinner = nullptr;
     g_loggedFirstWait = false;
     g_loggedFirstMove = false;
-    g_diagHavePost = false;
-    g_diagTick = 0;
+    g_havePost = false;
     g_link = nullptr;
     g_lastD = 0;
     g_noAssistTicks = 0;
@@ -429,7 +356,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     mods::hook::add_pre<SpinnerPosMove>(on_spinner_move_pre);
     mods::hook::add_post<SpinnerPosMove>(on_spinner_move_post);
 
-    svc_log->info(mod_ctx, "Spinner Speed carregado! (curva mais livre)");
+    svc_log->info(mod_ctx, "Spinner Speed carregado!");
     return MOD_OK;
 }
 
