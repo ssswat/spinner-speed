@@ -5,6 +5,7 @@
 //     ganha velocidade. Atacar varias vezes seguidas soma, ate o maximo.
 //  2) CURVA: o Spinner vira mais rapido (reforca a curva do proprio jogo).
 //     A frenagem continua como no jogo original.
+//  3) Link ENCARA a direcao em que o Spinner esta indo (giro suave).
 //  Nos TRILHOS o mod nao faz nada: o jogo controla o Spinner normalmente.
 //
 //  Opcoes ajustaveis DENTRO DO JOGO (janela Mods > Spinner Speed):
@@ -82,6 +83,14 @@ constexpr int kHoldTicks = 36;
 // Valor menor = subida mais suave.
 constexpr float kRampPerTick = 1.0f;
 
+// Link encara a direcao em que o Spinner anda: quanto da diferenca de angulo ele
+// corrige por tick (30 ticks = 1 segundo). 20 = suave; 50 = rapido; 100 = instantaneo.
+constexpr int kFacePercentPerTick = 20;
+
+// Limite de giro do Link por tick, em unidades do jogo (65536 = volta inteira).
+// 2500 = ~14 graus por tick, so para evitar um giro brusco em mudancas muito grandes.
+constexpr int kFaceMaxStep = 2500;
+
 // Abaixo desta velocidade o Spinner ja esta "morrendo": nao damos boost.
 constexpr float kMinSpeedToBoost = 2.0f;
 
@@ -124,7 +133,6 @@ float max_speed() { return static_cast<float>(read_cfg_int(g_varMaxSpeed, kDefau
 int turn_percent() { return read_cfg_int(g_varTurn, 300, 100, 800); }
 float step_per_attack() { return static_cast<float>(read_cfg_int(g_varStep, kDefaultStepPerAttack, 1, 60)); }
 
-daAlink_c* g_link = nullptr;      // Link (guardado no hook procSpinnerWait)
 int g_lastD = 0;                  // ultima mudanca de angulo feita pelo jogo (1 tick)
 int g_noAssistTicks = 0;          // pausa do reforco de curva (anti-oscilacao)
 bool g_havePost = false;
@@ -136,7 +144,6 @@ int g_postCur = 0;   // angulo do Spinner no fim do tick anterior
 HookAction on_link_spinner_wait_pre(ModContext*, void* args, void*, void*) {
     daAlink_c* link = mods::arg<daAlink_c*>(args, 0);   // arg 0 = "this"
     if (link == nullptr) return HOOK_CONTINUE;
-    g_link = link;
 
     if (!g_loggedFirstWait) {
         g_loggedFirstWait = true;
@@ -186,6 +193,25 @@ HookAction on_link_spinner_wait_pre(ModContext*, void* args, void*, void*) {
     return HOOK_CONTINUE;
 }
 
+// Roda DEPOIS de cada tick em que Link esta no Spinner: vira a frente de Link,
+// aos poucos, para a direcao em que o Spinner esta indo.
+void on_link_spinner_wait_post(ModContext*, void* args, void*, void*) {
+    daAlink_c* link = mods::arg<daAlink_c*>(args, 0);
+    if (link == nullptr) return;
+    daSpinner_c* spinner = link->getSpinnerActor();
+    if (spinner == nullptr) return;
+    if (spinner->checkPathMoveNow() != nullptr) return;   // nos trilhos: nao mexe
+
+    const int delta = static_cast<int16_t>(spinner->current.angle.y - link->shape_angle.y);
+    if (delta == 0) return;
+
+    int step = delta * kFacePercentPerTick / 100;
+    if (step == 0) step = delta > 0 ? 1 : -1;               // termina o ajuste fino
+    if (step > kFaceMaxStep) step = kFaceMaxStep;
+    if (step < -kFaceMaxStep) step = -kFaceMaxStep;
+    link->shape_angle.y = static_cast<int16_t>(link->shape_angle.y + step);
+}
+
 // Roda ANTES do movimento do Spinner (1x por tick).
 HookAction on_spinner_move_pre(ModContext*, void* args, void*, void*) {
     daSpinner_c* spinner = mods::arg<daSpinner_c*>(args, 0);
@@ -231,10 +257,6 @@ HookAction on_spinner_move_pre(ModContext*, void* args, void*, void*) {
             if (extra != 0) {
                 spinner->current.angle.y = static_cast<int16_t>(spinner->current.angle.y + extra);
                 spinner->shape_angle.y = static_cast<int16_t>(spinner->shape_angle.y + extra);
-                if (g_link != nullptr) {
-                    g_link->current.angle.y = static_cast<int16_t>(g_link->current.angle.y + extra);
-                    g_link->shape_angle.y = static_cast<int16_t>(g_link->shape_angle.y + extra);
-                }
             }
         }
     }
@@ -327,7 +349,6 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     g_loggedFirstWait = false;
     g_loggedFirstMove = false;
     g_havePost = false;
-    g_link = nullptr;
     g_lastD = 0;
     g_noAssistTicks = 0;
 
@@ -369,6 +390,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     }
 
     mods::hook::add_pre<LinkSpinnerWait>(on_link_spinner_wait_pre);
+    mods::hook::add_post<LinkSpinnerWait>(on_link_spinner_wait_post);
     mods::hook::add_pre<SpinnerPosMove>(on_spinner_move_pre);
     mods::hook::add_post<SpinnerPosMove>(on_spinner_move_post);
 
