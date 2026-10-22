@@ -5,6 +5,7 @@
 //     ganha velocidade. Atacar varias vezes seguidas soma, ate o maximo.
 //  2) CURVA: o Spinner vira mais rapido (reforca a curva do proprio jogo).
 //     A frenagem continua como no jogo original.
+//  Nos TRILHOS o mod nao faz nada: o jogo controla o Spinner normalmente.
 //
 //  Opcoes ajustaveis DENTRO DO JOGO (janela Mods > Spinner Speed):
 //    - Velocidade maxima
@@ -168,7 +169,7 @@ HookAction on_link_spinner_wait_pre(ModContext*, void* args, void*, void*) {
         g_prevAttack = attack;
     } else {
         // Passou de desligado para ligado => serras ativadas (de novo).
-        if (attack && !g_prevAttack && spinner != nullptr) {
+        if (attack && !g_prevAttack && spinner != nullptr && spinner->checkPathMoveNow() == nullptr) {
             const float cap = max_speed();
             const float step = step_per_attack();
             // Parte da velocidade atual (ou do alvo anterior, se for maior) e soma um degrau.
@@ -193,6 +194,17 @@ HookAction on_spinner_move_pre(ModContext*, void* args, void*, void*) {
     if (!g_loggedFirstMove) {
         g_loggedFirstMove = true;
         svc_log->info(mod_ctx, "Movimento do Spinner detectado (hook posMove funcionando)");
+    }
+
+    // Nos TRILHOS o mod nao mexe em nada (nem velocidade, nem direcao):
+    // o jogo controla o Spinner sozinho. Zera o estado para nao agir ao sair do trilho.
+    if (spinner->checkPathMoveNow() != nullptr) {
+        g_holdTicks = 0;
+        g_target = 0.0f;
+        g_noAssistTicks = 0;
+        g_lastD = 0;
+        g_havePost = false;
+        return HOOK_CONTINUE;
     }
 
     g_preCur = static_cast<int>(spinner->current.angle.y);
@@ -254,6 +266,10 @@ HookAction on_spinner_move_pre(ModContext*, void* args, void*, void*) {
 void on_spinner_move_post(ModContext*, void* args, void*, void*) {
     daSpinner_c* spinner = mods::arg<daSpinner_c*>(args, 0);
     if (spinner == nullptr) return;
+    if (spinner->checkPathMoveNow() != nullptr) {   // nos trilhos: nao mede a curva
+        g_havePost = false;
+        return;
+    }
     g_postCur = static_cast<int>(spinner->current.angle.y);
     g_havePost = true;
 }
