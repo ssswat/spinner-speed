@@ -91,6 +91,7 @@ using Clock = std::chrono::steady_clock;
 
 ConfigVarHandle g_varMaxSpeed = 0;
 ConfigVarHandle g_varStep = 0;
+ConfigVarHandle g_varTurn = 0;
 
 float g_target = 0.0f;                // velocidade-alvo atual (soma dos ataques)
 int g_holdTicks = 0;                  // ticks restantes segurando o alvo
@@ -119,6 +120,8 @@ int read_cfg_int(ConfigVarHandle var, int fallback, int lo, int hi) {
 }
 
 float max_speed() { return static_cast<float>(read_cfg_int(g_varMaxSpeed, kDefaultMaxSpeed, 30, 300)); }
+// Curva: 100 = igual ao jogo, 300 = 3x mais rapida.
+int turn_percent() { return read_cfg_int(g_varTurn, 300, 100, 800); }
 float step_per_attack() { return static_cast<float>(read_cfg_int(g_varStep, kDefaultStepPerAttack, 1, 60)); }
 
 // ----------------------------------------------------------------------------
@@ -153,6 +156,10 @@ StickRead read_stick() {
 }
 
 int g_diagTick = 0;
+daAlink_c* g_link = nullptr;      // Link (guardado no hook procSpinnerWait)
+int g_lastD = 0;                  // ultima mudanca de angulo feita pelo jogo (1 tick)
+int g_noAssistTicks = 0;          // pausa do reforco de curva (anti-oscilacao)
+int g_extraApplied = 0;           // reforco aplicado neste tick (so para o log)
 bool g_diagHavePost = false;
 int g_preCur = 0, g_preShape = 0, g_preGet = 0;
 float g_preSpeed = 0.0f;
@@ -164,6 +171,7 @@ float g_postSpeed = 0.0f;
 HookAction on_link_spinner_wait_pre(ModContext*, void* args, void*, void*) {
     daAlink_c* link = mods::arg<daAlink_c*>(args, 0);   // arg 0 = "this"
     if (link == nullptr) return HOOK_CONTINUE;
+    g_link = link;
 
     if (!g_loggedFirstWait) {
         g_loggedFirstWait = true;
@@ -181,6 +189,9 @@ HookAction on_link_spinner_wait_pre(ModContext*, void* args, void*, void*) {
         g_lastSpinner = spinner;
         g_logTick = 0;
         g_firstSample = true;
+        g_diagHavePost = false;   // nao compara com o giro anterior
+        g_lastD = 0;
+        g_noAssistTicks = 0;
         svc_log->info(mod_ctx, "Novo giro de Spinner: aguardando ativar as serras");
     }
     g_lastWait = now;
@@ -226,6 +237,39 @@ HookAction on_spinner_move_pre(ModContext*, void* args, void*, void*) {
     g_preShape = static_cast<int>(spinner->shape_angle.y);
     g_preGet = static_cast<int>(spinner->getAngleY());
     g_preSpeed = spinner->speedF;
+
+    // ------------------------------------------------------------------
+    //  CURVA MAIS LIVRE: o jogo gira o Spinner ate 360 unidades por tick.
+    //  Medimos quanto o jogo girou neste tick e somamos um reforco na
+    //  mesma direcao (curva_percent/100 vezes mais rapido).
+    // ------------------------------------------------------------------
+    g_extraApplied = 0;
+
+    if (g_diagHavePost) {
+        const int d = static_cast<int16_t>(g_preCur - g_postCur);   // girada pelo jogo neste tick
+        if (d != 0) {
+            // Mudou de sentido? Provavel ultrapassagem do alvo: pausa o reforco um instante.
+            if (g_lastD != 0 && ((d > 0) != (g_lastD > 0))) g_noAssistTicks = 8;
+            g_lastD = d;
+        }
+        if (g_noAssistTicks > 0) --g_noAssistTicks;
+
+        const int ad = d < 0 ? -d : d;
+        // So reforca passos "cheios" do jogo (360); o passo final, que chega no alvo, nao.
+        if (g_noAssistTicks == 0 && ad >= 300) {
+            const int pct = turn_percent();
+            const int extra = static_cast<int>(static_cast<float>(d) * (static_cast<float>(pct) / 100.0f - 1.0f));
+            if (extra != 0) {
+                spinner->current.angle.y = static_cast<int16_t>(spinner->current.angle.y + extra);
+                spinner->shape_angle.y = static_cast<int16_t>(spinner->shape_angle.y + extra);
+                if (g_link != nullptr) {
+                    g_link->current.angle.y = static_cast<int16_t>(g_link->current.angle.y + extra);
+                    g_link->shape_angle.y = static_cast<int16_t>(g_link->shape_angle.y + extra);
+                }
+                g_extraApplied = extra;
+            }
+        }
+    }
 
     if (g_holdTicks <= 0) {
         g_target = 0.0f;   // acabou o periodo: proximo ataque parte da velocidade real
@@ -274,11 +318,11 @@ void on_spinner_move_post(ModContext*, void* args, void*, void*) {
             outSpeed = g_preSpeed - g_postSpeed;
         }
         const StickRead st = read_stick<mDoCPd_c>();
-        log_fmt("DIAG vel=%.1f | dentro: cur%+d shape%+d vel%+.2f | fora: cur%+d shape%+d vel%+.2f | ang cur=%d shape=%d get=%d | stick %s %.2f,%.2f",
+        log_fmt("DIAG vel=%.1f | dentro: cur%+d shape%+d vel%+.2f | fora: cur%+d shape%+d vel%+.2f | ang cur=%d shape=%d get=%d | stick %s %.2f,%.2f | reforco %+d",
                 g_preSpeed, inCur, inShape, postSpeed - g_preSpeed,
                 outCur, outShape, outSpeed,
                 postCur, postShape, g_preGet,
-                st.ok ? "ok" : "indisp.", st.x, st.y);
+                st.ok ? "ok" : "indisp.", st.x, st.y, g_extraApplied);
     }
     g_postCur = postCur;
     g_postShape = postShape;
@@ -312,6 +356,17 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
     stepCtl.step = 1;
     svc_ui->pane_add_control(mod_ctx, panel, &stepCtl, nullptr);
 
+    UiControlDesc turnCtl = UI_CONTROL_DESC_INIT;
+    turnCtl.kind = UI_CONTROL_NUMBER;
+    turnCtl.label = "Curva (100 = normal do jogo)";
+    turnCtl.help_rml = "Quao rapido o Spinner vira. 100 e o normal do jogo; 300 vira 3 vezes mais rapido.";
+    turnCtl.binding = UI_BINDING_CONFIG_VAR;
+    turnCtl.config_var = g_varTurn;
+    turnCtl.min = 100;
+    turnCtl.max = 800;
+    turnCtl.step = 25;
+    svc_ui->pane_add_control(mod_ctx, panel, &turnCtl, nullptr);
+
     return MOD_OK;
 }
 
@@ -329,6 +384,9 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     g_loggedFirstMove = false;
     g_diagHavePost = false;
     g_diagTick = 0;
+    g_link = nullptr;
+    g_lastD = 0;
+    g_noAssistTicks = 0;
 
     // Opcoes salvas no config do Dusklight.
     ConfigVarDesc maxDesc = CONFIG_VAR_DESC_INIT;
@@ -338,6 +396,15 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (svc_config->register_var(mod_ctx, &maxDesc, &g_varMaxSpeed) != MOD_OK) {
         g_varMaxSpeed = 0;
         svc_log->warn(mod_ctx, "Nao foi possivel registrar a opcao de velocidade maxima (usando padrao)");
+    }
+
+    ConfigVarDesc turnDesc = CONFIG_VAR_DESC_INIT;
+    turnDesc.name = "turnPercent";
+    turnDesc.type = CONFIG_VAR_INT;
+    turnDesc.default_int = 300;
+    if (svc_config->register_var(mod_ctx, &turnDesc, &g_varTurn) != MOD_OK) {
+        g_varTurn = 0;
+        svc_log->warn(mod_ctx, "Nao foi possivel registrar a opcao de curva (usando padrao)");
     }
 
     ConfigVarDesc stepDesc = CONFIG_VAR_DESC_INIT;
@@ -350,7 +417,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     }
 
     // Painel com as opcoes na janela Mods (so se as opcoes existem).
-    if (g_varMaxSpeed != 0 && g_varStep != 0) {
+    if (g_varMaxSpeed != 0 && g_varStep != 0 && g_varTurn != 0) {
         UiModsPanelDesc panel = UI_MODS_PANEL_DESC_INIT;
         panel.build = build_panel;
         if (svc_ui->register_mods_panel(mod_ctx, &panel) != MOD_OK) {
@@ -362,7 +429,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     mods::hook::add_pre<SpinnerPosMove>(on_spinner_move_pre);
     mods::hook::add_post<SpinnerPosMove>(on_spinner_move_post);
 
-    svc_log->info(mod_ctx, "Spinner Speed carregado! (versao com DIAGNOSTICO de direcao/frenagem)");
+    svc_log->info(mod_ctx, "Spinner Speed carregado! (curva mais livre)");
     return MOD_OK;
 }
 
