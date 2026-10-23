@@ -27,7 +27,6 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
-#include <cstdarg>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -135,21 +134,6 @@ Clock::time_point g_lastWait{};       // ultima vez que Link esteve "no Spinner"
 bool g_loggedFirstWait = false;
 bool g_loggedFirstMove = false;
 
-void log_msg(const char* fmt, double a = 0, double b = 0, double c = 0) {
-    char buf[200];
-    std::snprintf(buf, sizeof(buf), fmt, a, b, c);
-    svc_log->info(mod_ctx, buf);
-}
-
-void log_fmt(const char* fmt, ...) {
-    char buf[300];
-    va_list ap;
-    va_start(ap, fmt);
-    std::vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    svc_log->info(mod_ctx, buf);
-}
-
 int read_cfg_int(ConfigVarHandle var, int fallback, int lo, int hi) {
     int64_t v = fallback;
     if (var != 0) {
@@ -173,8 +157,8 @@ float motor_accel_per_tick() {
 }
 // Loop da animacao (no modo motor): quando a animacao chega ao quadro FINAL, volta ao INICIAL.
 // Final = 0 desliga o loop.
-int loop_start() { return read_cfg_int(g_varLoopStart, 0, 0, 1000); }
-int loop_end() { return read_cfg_int(g_varLoopEnd, 0, 0, 1000); }
+int loop_start() { return read_cfg_int(g_varLoopStart, 4, 0, 1000); }
+int loop_end() { return read_cfg_int(g_varLoopEnd, 5, 0, 1000); }
 float step_per_attack() { return static_cast<float>(read_cfg_int(g_varStep, kDefaultStepPerAttack, 1, 60)); }
 
 int g_lastD = 0;                  // ultima mudanca de angulo feita pelo jogo (1 tick)
@@ -209,24 +193,62 @@ bool g_scanDone = false;
 int16_t g_faceSmooth = 0;        // angulo "suavizado" que queremos mostrar (metodo 4)
 bool g_smoothInit = false;
 
+std::ptrdiff_t g_knownOff[kMaxCand];   // campos ja validados em giros anteriores
+int g_knownCount = 0;
+
+bool contains_off(const std::ptrdiff_t* list, int count, std::ptrdiff_t off) {
+    for (int i = 0; i < count; ++i) {
+        if (list[i] == off) return true;
+    }
+    return false;
+}
+
 void scan_link_angles(daAlink_c* link) {
-    g_candCount = 0;
     const unsigned char* base = reinterpret_cast<const unsigned char*>(link);
     const int16_t target = link->shape_angle.y;
     const std::ptrdiff_t offShape = reinterpret_cast<const unsigned char*>(&link->shape_angle.y) - base;
     const std::ptrdiff_t offCur = reinterpret_cast<const unsigned char*>(&link->current.angle.y) - base;
     const std::size_t startAt = sizeof(fopAc_ac_c);   // ignora os campos comuns de qualquer ator
+
+    // 1) Varredura bruta: todos os campos de 16 bits iguais ao angulo inicial.
+    std::ptrdiff_t raw[kMaxCand];
+    int rawCount = 0;
+    int rawTotal = 0;
     for (std::size_t off = startAt; off + 2 <= sizeof(daAlink_c); off += 2) {
         int16_t v;
         std::memcpy(&v, base + off, 2);
-        if (v == target && static_cast<std::ptrdiff_t>(off) != offShape &&
-            static_cast<std::ptrdiff_t>(off) != offCur && g_candCount < kMaxCand) {
-            g_candOff[g_candCount++] = static_cast<std::ptrdiff_t>(off);
+        const std::ptrdiff_t o = static_cast<std::ptrdiff_t>(off);
+        if (v == target && o != offShape && o != offCur) {
+            ++rawTotal;
+            if (rawCount < kMaxCand) raw[rawCount++] = o;
         }
     }
+
+    // 2) Filtro: poucos campos = varredura confiavel. Muitos = o valor e comum (ex.: -32768)
+    //    e a maioria e coincidencia; nesse caso so usamos campos ja validados antes.
+    g_candCount = 0;
+    if (rawTotal >= 1 && rawTotal <= 8) {
+        for (int i = 0; i < rawCount; ++i) {
+            if (g_knownCount == 0 || contains_off(g_knownOff, g_knownCount, raw[i])) {
+                g_candOff[g_candCount++] = raw[i];
+            }
+        }
+        if (g_candCount == 0) {                       // nada em comum com o historico: recomeca
+            for (int i = 0; i < rawCount; ++i) g_candOff[g_candCount++] = raw[i];
+        }
+        g_knownCount = g_candCount;                   // guarda os campos validados
+        for (int i = 0; i < g_candCount; ++i) g_knownOff[i] = g_candOff[i];
+    } else if (g_knownCount > 0) {
+        for (int i = 0; i < g_knownCount; ++i) {
+            int16_t v;
+            std::memcpy(&v, base + g_knownOff[i], 2);
+            if (v == target) g_candOff[g_candCount++] = g_knownOff[i];
+        }
+    }
+
     char buf[320];
-    int n = std::snprintf(buf, sizeof(buf), "FACE-SCAN: valor %d | %d campo(s) iguais no Link (fora shape/current):",
-                          static_cast<int>(target), g_candCount);
+    int n = std::snprintf(buf, sizeof(buf), "FACE-SCAN: valor %d | encontrados %d | usando %d:",
+                          static_cast<int>(target), rawTotal, g_candCount);
     for (int i = 0; i < g_candCount && n > 0 && n < static_cast<int>(sizeof(buf)) - 12; ++i) {
         n += std::snprintf(buf + n, sizeof(buf) - n, " +0x%X", static_cast<unsigned>(g_candOff[i]));
     }
@@ -275,11 +297,10 @@ bool anim_write(A& a, float frame) {
     }
 }
 
-int g_animLog = 0;
 bool g_warnedNoAnimApi = false;
 
-// Registra o quadro da animacao e, no modo motor, faz o loop entre o quadro inicial e o final.
-void anim_tick(daSpinner_c* spinner, bool held, bool motorHeld) {
+// No modo motor, faz o loop da animacao: ao chegar no quadro final, volta ao inicial.
+void anim_tick(daSpinner_c* spinner, bool motorHeld) {
     auto& bck = spinner->*steal_field(SpinnerBckTag{});
     float frame = 0.0f, endFrame = 0.0f;
     const bool ok = anim_read(bck, frame, endFrame);
@@ -290,12 +311,6 @@ void anim_tick(daSpinner_c* spinner, bool held, bool motorHeld) {
             svc_log->warn(mod_ctx, "ANIM: nao consegui ler a animacao do Spinner (API diferente)");
         }
         return;
-    }
-
-    if ((g_animLog++ % 6) == 0) {
-        log_fmt("ANIM: quadro=%.1f de %.1f | A=%d motor=%d | JumpFlg=%d",
-                static_cast<double>(frame), static_cast<double>(endFrame),
-                held ? 1 : 0, motorHeld ? 1 : 0, static_cast<int>(spinner->getJumpFlg()));
     }
 
     const int ls = loop_start();
@@ -378,7 +393,6 @@ HookAction on_link_spinner_wait_pre(ModContext*, void* args, void*, void*) {
             if (next > cap) next = cap;
             g_target = next;
             g_holdTicks = kHoldTicks;
-            log_msg("Serras ativadas! Nova velocidade-alvo %.1f (maxima %.0f)", g_target, cap);
         }
         g_prevAttack = attack;
     }
@@ -450,13 +464,9 @@ HookAction on_spinner_move_pre(ModContext*, void* args, void*, void*) {
         const bool holdA = read_hold_a<mDoCPd_c>();
         const bool holdJump = spinner->getButtonJump() != 0;   // aviso do proprio Spinner
         const bool held = holdA || holdJump;
-        if (held != g_lastHeld) {
-            g_lastHeld = held;
-            log_msg("Botao de ataque: segurando=%.0f (A do jogo=%.0f, aviso do Spinner=%.0f)",
-                    held ? 1.0 : 0.0, holdA ? 1.0 : 0.0, holdJump ? 1.0 : 0.0);
-        }
+        g_lastHeld = held;
         const bool motorHeld = motor_on() != 0 && held;
-        anim_tick(spinner, held, motorHeld);
+        anim_tick(spinner, motorHeld);
         if (motorHeld) {
             const float capM = max_speed();
             const float v = spinner->speedF;
@@ -591,7 +601,7 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
     UiControlDesc loopStartCtl = UI_CONTROL_DESC_INIT;
     loopStartCtl.kind = UI_CONTROL_NUMBER;
     loopStartCtl.label = "Loop da animacao: quadro inicial";
-    loopStartCtl.help_rml = "No modo motor, a animacao volta para este quadro ao chegar no quadro final. Veja os quadros no log (linhas ANIM).";
+    loopStartCtl.help_rml = "No modo motor, a animacao volta para este quadro ao chegar no quadro final. A animacao de ataque tem 15 quadros; 4 e 5 mantem as laminas abertas.";
     loopStartCtl.binding = UI_BINDING_CONFIG_VAR;
     loopStartCtl.config_var = g_varLoopStart;
     loopStartCtl.min = 0;
@@ -629,11 +639,11 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     g_lastD = 0;
     g_noAssistTicks = 0;
     g_link = nullptr;
-    g_animLog = 0;
     g_warnedNoAnimApi = false;
     g_scanDone = false;
     g_smoothInit = false;
     g_candCount = 0;
+    g_knownCount = 0;
     g_lastHeld = false;
 
     // Opcoes salvas no config do Dusklight.
@@ -685,7 +695,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     ConfigVarDesc loopStartDesc = CONFIG_VAR_DESC_INIT;
     loopStartDesc.name = "animLoopStart";
     loopStartDesc.type = CONFIG_VAR_INT;
-    loopStartDesc.default_int = 0;
+    loopStartDesc.default_int = 4;
     if (svc_config->register_var(mod_ctx, &loopStartDesc, &g_varLoopStart) != MOD_OK) {
         g_varLoopStart = 0;
         svc_log->warn(mod_ctx, "Nao foi possivel registrar o quadro inicial do loop (usando padrao)");
@@ -694,7 +704,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     ConfigVarDesc loopEndDesc = CONFIG_VAR_DESC_INIT;
     loopEndDesc.name = "animLoopEnd";
     loopEndDesc.type = CONFIG_VAR_INT;
-    loopEndDesc.default_int = 0;
+    loopEndDesc.default_int = 5;
     if (svc_config->register_var(mod_ctx, &loopEndDesc, &g_varLoopEnd) != MOD_OK) {
         g_varLoopEnd = 0;
         svc_log->warn(mod_ctx, "Nao foi possivel registrar o quadro final do loop (usando padrao)");
