@@ -13,8 +13,9 @@
 //    - Velocidade maxima
 //    - Ganho de velocidade por ataque de serra
 //    - Curva (100 = normal do jogo)
-//    - Link encara o Spinner (metodo 0 a 4)
+//    - Link encara o Spinner (liga/desliga)
 //    - Modo motor (liga/desliga) e aceleracao do motor
+//    - Loop da animacao do Spinner no modo motor (quadro inicial e final)
 //
 //  O mod escreve eventos no log (janela Mods > Spinner Speed > Logs).
 // ============================================================================
@@ -56,6 +57,18 @@
 #include "d/actor/d_a_spinner.h"   // classe daSpinner_c
 #include "d/actor/d_a_alink.h"     // classe daAlink_c (Link)
 #include "m_Do/m_Do_controller_pad.h"  // botoes do jogo (A segurado)
+
+// Acesso ao campo PRIVADO daSpinner_c::mBck (a animacao do Spinner). A instanciacao
+// explicita de um template nao verifica "private", entao conseguimos o ponteiro do campo.
+template <typename Tag, typename Tag::type M>
+struct FieldRobber {
+    friend typename Tag::type steal_field(Tag) { return M; }
+};
+struct SpinnerBckTag {
+    typedef mDoExt_bckAnm daSpinner_c::*type;
+    friend type steal_field(SpinnerBckTag);
+};
+template struct FieldRobber<SpinnerBckTag, &daSpinner_c::mBck>;
 
 DEFINE_MOD();                               // uma vez so, neste arquivo
 IMPORT_SERVICE(LogService, svc_log);
@@ -110,6 +123,8 @@ ConfigVarHandle g_varTurn = 0;
 ConfigVarHandle g_varFace = 0;
 ConfigVarHandle g_varMotor = 0;
 ConfigVarHandle g_varMotorAccel = 0;
+ConfigVarHandle g_varLoopStart = 0;
+ConfigVarHandle g_varLoopEnd = 0;
 
 float g_target = 0.0f;                // velocidade-alvo atual (soma dos ataques)
 int g_holdTicks = 0;                  // ticks restantes segurando o alvo
@@ -148,16 +163,18 @@ int read_cfg_int(ConfigVarHandle var, int fallback, int lo, int hi) {
 float max_speed() { return static_cast<float>(read_cfg_int(g_varMaxSpeed, kDefaultMaxSpeed, 30, 300)); }
 // Curva: 100 = igual ao jogo, 300 = 3x mais rapida.
 int turn_percent() { return read_cfg_int(g_varTurn, 300, 100, 800); }
-// Link encara o Spinner: 0 = desligado, 1 = so o modelo, 2 = modelo + direcao,
-// 3 = funcao do proprio jogo (setPlayerPosAndAngle),
-// 4 = EXPERIMENTAL: escreve tambem nos campos de Link que guardam a direcao inicial.
-int face_method() { return read_cfg_int(g_varFace, 3, 0, 4); }
+// Link encara o Spinner: 0 = desligado, 1 = ligado.
+int face_method() { return read_cfg_int(g_varFace, 1, 0, 1); }
 // Modo motor: 0 = desligado, 1 = ligado.
 int motor_on() { return read_cfg_int(g_varMotor, 0, 0, 1); }
 // Aceleracao do motor em unidades por SEGUNDO (30 ticks = 1 s).
 float motor_accel_per_tick() {
     return static_cast<float>(read_cfg_int(g_varMotorAccel, 45, 5, 300)) / 30.0f;
 }
+// Loop da animacao (no modo motor): quando a animacao chega ao quadro FINAL, volta ao INICIAL.
+// Final = 0 desliga o loop.
+int loop_start() { return read_cfg_int(g_varLoopStart, 0, 0, 1000); }
+int loop_end() { return read_cfg_int(g_varLoopEnd, 0, 0, 1000); }
 float step_per_attack() { return static_cast<float>(read_cfg_int(g_varStep, kDefaultStepPerAttack, 1, 60)); }
 
 int g_lastD = 0;                  // ultima mudanca de angulo feita pelo jogo (1 tick)
@@ -167,9 +184,6 @@ int g_preCur = 0;    // angulo do Spinner no inicio do tick
 int g_postCur = 0;   // angulo do Spinner no fim do tick anterior
 float g_postSpeed = 0.0f;  // velocidade do Spinner no fim do tick anterior
 daAlink_c* g_link = nullptr;        // Link (guardado no hook procSpinnerWait)
-int g_faceWritten = 0;              // ultimo angulo que escrevemos em Link
-bool g_faceHave = false;
-int g_faceLog = 0;
 bool g_lastHeld = false;
 
 // Le o botao A do JOGO (ja com o mapeamento que voce fez no Dusklight).
@@ -194,7 +208,6 @@ int g_candCount = 0;
 bool g_scanDone = false;
 int16_t g_faceSmooth = 0;        // angulo "suavizado" que queremos mostrar (metodo 4)
 bool g_smoothInit = false;
-int g_candLog = 0;
 
 void scan_link_angles(daAlink_c* link) {
     g_candCount = 0;
@@ -220,20 +233,7 @@ void scan_link_angles(daAlink_c* link) {
     svc_log->info(mod_ctx, buf);
 }
 
-void log_candidate_values(daAlink_c* link) {
-    if (g_candCount == 0) return;
-    const unsigned char* base = reinterpret_cast<const unsigned char*>(link);
-    char buf[320];
-    int n = std::snprintf(buf, sizeof(buf), "FACE-CAND:");
-    for (int i = 0; i < g_candCount && n > 0 && n < static_cast<int>(sizeof(buf)) - 20; ++i) {
-        int16_t v;
-        std::memcpy(&v, base + g_candOff[i], 2);
-        n += std::snprintf(buf + n, sizeof(buf) - n, " +0x%X=%d", static_cast<unsigned>(g_candOff[i]), static_cast<int>(v));
-    }
-    svc_log->info(mod_ctx, buf);
-}
-
-// Metodo 4: escreve o angulo suavizado no shape_angle e nos campos candidatos.
+// Escreve o angulo suavizado no shape_angle e nos campos candidatos.
 void write_face_candidates(daAlink_c* link) {
     link->shape_angle.y = g_faceSmooth;
     unsigned char* base = reinterpret_cast<unsigned char*>(link);
@@ -243,68 +243,68 @@ void write_face_candidates(daAlink_c* link) {
     }
 }
 
-// Chama a funcao do proprio jogo que posiciona/vira o Link (a mesma usada em cenas).
-// Se ela nao existir nesta versao, devolve falso e nada e chamado.
-template <class L>
-bool game_set_pos_angle(L* link, int16_t angle) {
-    if constexpr (requires { link->setPlayerPosAndAngle(&link->current.pos, angle, 0); }) {
-        link->setPlayerPosAndAngle(&link->current.pos, angle, 0);
+// Reaplica a orientacao de Link (usada nos hooks "post").
+void apply_face(daAlink_c* link, daSpinner_c* spinner) {
+    if (face_method() == 0 || link == nullptr || spinner == nullptr) return;
+    if (spinner->checkPathMoveNow() != nullptr) return;   // nos trilhos: nao mexe
+    if (g_smoothInit) write_face_candidates(link);
+}
+
+// ---------------------------------------------------------------------------
+//  Animacao do Spinner (mBck). Os nomes das funcoes da animacao sao detectados em
+//  tempo de compilacao: se algum nao existir, simplesmente nao fazemos nada.
+// ---------------------------------------------------------------------------
+template <class A>
+bool anim_read(A& a, float& frame, float& endFrame) {
+    if constexpr (requires { a.getFrame(); a.getEndFrame(); }) {
+        frame = static_cast<float>(a.getFrame());
+        endFrame = static_cast<float>(a.getEndFrame());
         return true;
     } else {
         return false;
     }
 }
 
-int g_faceCalls = 0;
-bool g_warnedNoGameFn = false;
-
-// Gira a frente de Link, aos poucos, para a direcao em que o Spinner esta indo.
-void apply_face(daAlink_c* link, daSpinner_c* spinner) {
-    const int method = face_method();
-    if (method == 0 || link == nullptr || spinner == nullptr) return;
-    if (spinner->checkPathMoveNow() != nullptr) return;   // nos trilhos: nao mexe
-
-    const int delta = static_cast<int16_t>(spinner->current.angle.y - link->shape_angle.y);
-
-    // Diagnostico: angulos do Link e do Spinner (a cada ~20 chamadas).
-    if ((g_faceCalls++ % 20) == 0) {
-        log_fmt("FACE: metodo=%d | Link shape=%d cur=%d | Spinner cur=%d | diferenca=%d",
-                method, static_cast<int>(link->shape_angle.y), static_cast<int>(link->current.angle.y),
-                static_cast<int>(spinner->current.angle.y), delta);
+template <class A>
+bool anim_write(A& a, float frame) {
+    if constexpr (requires { a.setFrame(frame); }) {
+        a.setFrame(frame);
+        return true;
+    } else {
+        return false;
     }
-    if ((g_candLog++ % 40) == 0) log_candidate_values(link);
+}
 
-    if (method >= 4) {                       // metodo 4: o estado suavizado e atualizado no hook "pre"
-        if (g_smoothInit) write_face_candidates(link);
+int g_animLog = 0;
+bool g_warnedNoAnimApi = false;
+
+// Registra o quadro da animacao e, no modo motor, faz o loop entre o quadro inicial e o final.
+void anim_tick(daSpinner_c* spinner, bool held, bool motorHeld) {
+    auto& bck = spinner->*steal_field(SpinnerBckTag{});
+    float frame = 0.0f, endFrame = 0.0f;
+    const bool ok = anim_read(bck, frame, endFrame);
+
+    if (!ok) {
+        if (!g_warnedNoAnimApi) {
+            g_warnedNoAnimApi = true;
+            svc_log->warn(mod_ctx, "ANIM: nao consegui ler a animacao do Spinner (API diferente)");
+        }
         return;
     }
 
-    if (delta == 0) return;
+    if ((g_animLog++ % 6) == 0) {
+        log_fmt("ANIM: quadro=%.1f de %.1f | A=%d motor=%d | JumpFlg=%d",
+                static_cast<double>(frame), static_cast<double>(endFrame),
+                held ? 1 : 0, motorHeld ? 1 : 0, static_cast<int>(spinner->getJumpFlg()));
+    }
 
-    int step = delta * kFacePercentPerTick / 100;
-    if (step == 0) step = delta > 0 ? 1 : -1;               // termina o ajuste fino
-    if (step > kFaceMaxStep) step = kFaceMaxStep;
-    if (step < -kFaceMaxStep) step = -kFaceMaxStep;
-
-    const int16_t shape = static_cast<int16_t>(link->shape_angle.y + step);
-
-    if (method >= 3) {
-        if (!game_set_pos_angle(link, shape)) {
-            if (!g_warnedNoGameFn) {
-                g_warnedNoGameFn = true;
-                svc_log->warn(mod_ctx, "FACE: funcao do jogo indisponivel; usando o metodo 2");
-            }
-            link->shape_angle.y = shape;
-            link->current.angle.y = static_cast<int16_t>(link->current.angle.y + step);
-        }
-    } else {
-        link->shape_angle.y = shape;
-        if (method >= 2) {
-            link->current.angle.y = static_cast<int16_t>(link->current.angle.y + step);
+    const int ls = loop_start();
+    const int le = loop_end();
+    if (motorHeld && le > 0 && le > ls && spinner->checkPathMoveNow() == nullptr) {
+        if (frame >= static_cast<float>(le)) {
+            anim_write(bck, static_cast<float>(ls));
         }
     }
-    g_faceWritten = static_cast<int>(shape);
-    g_faceHave = true;
 }
 
 // Roda ANTES de cada tick em que Link esta no Spinner.
@@ -313,14 +313,6 @@ HookAction on_link_spinner_wait_pre(ModContext*, void* args, void*, void*) {
     daAlink_c* link = mods::arg<daAlink_c*>(args, 0);   // arg 0 = "this"
     if (link == nullptr) return HOOK_CONTINUE;
     g_link = link;
-
-    // Diagnostico da orientacao de Link: o jogo desfez o que escrevemos no tick anterior?
-    if (g_faceHave) {
-        const int now_shape = static_cast<int>(link->shape_angle.y);
-        if (now_shape != g_faceWritten && (g_faceLog++ % 20) == 0) {
-            log_msg("FACE: escrevi %.0f mas o jogo deixou em %.0f (sobrescrito)", g_faceWritten, now_shape);
-        }
-    }
 
     if (!g_loggedFirstWait) {
         g_loggedFirstWait = true;
@@ -340,7 +332,6 @@ HookAction on_link_spinner_wait_pre(ModContext*, void* args, void*, void*) {
         g_havePost = false;   // nao compara com o giro anterior
         g_lastD = 0;
         g_noAssistTicks = 0;
-        g_faceHave = false;
         g_scanDone = false;
         g_smoothInit = false;
         svc_log->info(mod_ctx, "Novo giro de Spinner: aguardando ativar as serras");
@@ -353,8 +344,8 @@ HookAction on_link_spinner_wait_pre(ModContext*, void* args, void*, void*) {
         scan_link_angles(link);
     }
 
-    // Metodo 4: atualiza o angulo suavizado e escreve ANTES do jogo refazer o shape_angle.
-    if (face_method() >= 4 && spinner != nullptr && spinner->checkPathMoveNow() == nullptr) {
+    // Atualiza o angulo suavizado e escreve ANTES do jogo refazer o shape_angle.
+    if (face_method() != 0 && spinner != nullptr && spinner->checkPathMoveNow() == nullptr) {
         if (!g_smoothInit) {
             g_faceSmooth = link->shape_angle.y;
             g_smoothInit = true;
@@ -464,7 +455,9 @@ HookAction on_spinner_move_pre(ModContext*, void* args, void*, void*) {
             log_msg("Botao de ataque: segurando=%.0f (A do jogo=%.0f, aviso do Spinner=%.0f)",
                     held ? 1.0 : 0.0, holdA ? 1.0 : 0.0, holdJump ? 1.0 : 0.0);
         }
-        if (motor_on() != 0 && held) {
+        const bool motorHeld = motor_on() != 0 && held;
+        anim_tick(spinner, held, motorHeld);
+        if (motorHeld) {
             const float capM = max_speed();
             const float v = spinner->speedF;
             if (v >= kMinSpeedToBoost && v < capM) {
@@ -564,12 +557,12 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
 
     UiControlDesc faceCtl = UI_CONTROL_DESC_INIT;
     faceCtl.kind = UI_CONTROL_NUMBER;
-    faceCtl.label = "Link encara o Spinner (0 = desligado, 1 a 4)";
-    faceCtl.help_rml = "Faz o Link olhar para onde o Spinner vai. Se um metodo nao funcionar, tente outro: 1 = so o modelo, 2 = modelo e direcao, 3 = funcao do proprio jogo, 4 = experimental (escreve nos campos que guardam a direcao inicial).";
+    faceCtl.label = "Link encara o Spinner (0 = desligado, 1 = ligado)";
+    faceCtl.help_rml = "Faz o Link olhar, de forma suave, para a direcao em que o Spinner esta indo.";
     faceCtl.binding = UI_BINDING_CONFIG_VAR;
     faceCtl.config_var = g_varFace;
     faceCtl.min = 0;
-    faceCtl.max = 4;
+    faceCtl.max = 1;
     faceCtl.step = 1;
     svc_ui->pane_add_control(mod_ctx, panel, &faceCtl, nullptr);
 
@@ -595,6 +588,28 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
     accelCtl.step = 5;
     svc_ui->pane_add_control(mod_ctx, panel, &accelCtl, nullptr);
 
+    UiControlDesc loopStartCtl = UI_CONTROL_DESC_INIT;
+    loopStartCtl.kind = UI_CONTROL_NUMBER;
+    loopStartCtl.label = "Loop da animacao: quadro inicial";
+    loopStartCtl.help_rml = "No modo motor, a animacao volta para este quadro ao chegar no quadro final. Veja os quadros no log (linhas ANIM).";
+    loopStartCtl.binding = UI_BINDING_CONFIG_VAR;
+    loopStartCtl.config_var = g_varLoopStart;
+    loopStartCtl.min = 0;
+    loopStartCtl.max = 1000;
+    loopStartCtl.step = 1;
+    svc_ui->pane_add_control(mod_ctx, panel, &loopStartCtl, nullptr);
+
+    UiControlDesc loopEndCtl = UI_CONTROL_DESC_INIT;
+    loopEndCtl.kind = UI_CONTROL_NUMBER;
+    loopEndCtl.label = "Loop da animacao: quadro final (0 = desligado)";
+    loopEndCtl.help_rml = "No modo motor, ao chegar neste quadro a animacao volta ao quadro inicial. 0 desliga o loop.";
+    loopEndCtl.binding = UI_BINDING_CONFIG_VAR;
+    loopEndCtl.config_var = g_varLoopEnd;
+    loopEndCtl.min = 0;
+    loopEndCtl.max = 1000;
+    loopEndCtl.step = 1;
+    svc_ui->pane_add_control(mod_ctx, panel, &loopEndCtl, nullptr);
+
     return MOD_OK;
 }
 
@@ -614,13 +629,11 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     g_lastD = 0;
     g_noAssistTicks = 0;
     g_link = nullptr;
-    g_faceHave = false;
-    g_faceCalls = 0;
+    g_animLog = 0;
+    g_warnedNoAnimApi = false;
     g_scanDone = false;
     g_smoothInit = false;
     g_candCount = 0;
-    g_candLog = 0;
-    g_warnedNoGameFn = false;
     g_lastHeld = false;
 
     // Opcoes salvas no config do Dusklight.
@@ -645,7 +658,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     ConfigVarDesc faceDesc = CONFIG_VAR_DESC_INIT;
     faceDesc.name = "faceMethod";
     faceDesc.type = CONFIG_VAR_INT;
-    faceDesc.default_int = 3;
+    faceDesc.default_int = 1;
     if (svc_config->register_var(mod_ctx, &faceDesc, &g_varFace) != MOD_OK) {
         g_varFace = 0;
         svc_log->warn(mod_ctx, "Nao foi possivel registrar a opcao de orientacao do Link (usando padrao)");
@@ -669,6 +682,24 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         svc_log->warn(mod_ctx, "Nao foi possivel registrar a aceleracao do motor (usando padrao)");
     }
 
+    ConfigVarDesc loopStartDesc = CONFIG_VAR_DESC_INIT;
+    loopStartDesc.name = "animLoopStart";
+    loopStartDesc.type = CONFIG_VAR_INT;
+    loopStartDesc.default_int = 0;
+    if (svc_config->register_var(mod_ctx, &loopStartDesc, &g_varLoopStart) != MOD_OK) {
+        g_varLoopStart = 0;
+        svc_log->warn(mod_ctx, "Nao foi possivel registrar o quadro inicial do loop (usando padrao)");
+    }
+
+    ConfigVarDesc loopEndDesc = CONFIG_VAR_DESC_INIT;
+    loopEndDesc.name = "animLoopEnd";
+    loopEndDesc.type = CONFIG_VAR_INT;
+    loopEndDesc.default_int = 0;
+    if (svc_config->register_var(mod_ctx, &loopEndDesc, &g_varLoopEnd) != MOD_OK) {
+        g_varLoopEnd = 0;
+        svc_log->warn(mod_ctx, "Nao foi possivel registrar o quadro final do loop (usando padrao)");
+    }
+
     ConfigVarDesc stepDesc = CONFIG_VAR_DESC_INIT;
     stepDesc.name = "stepPerAttack";
     stepDesc.type = CONFIG_VAR_INT;
@@ -680,7 +711,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
 
     // Painel com as opcoes na janela Mods (so se as opcoes existem).
     if (g_varMaxSpeed != 0 && g_varStep != 0 && g_varTurn != 0 && g_varFace != 0 &&
-        g_varMotor != 0 && g_varMotorAccel != 0) {
+        g_varMotor != 0 && g_varMotorAccel != 0 && g_varLoopStart != 0 && g_varLoopEnd != 0) {
         UiModsPanelDesc panel = UI_MODS_PANEL_DESC_INIT;
         panel.build = build_panel;
         if (svc_ui->register_mods_panel(mod_ctx, &panel) != MOD_OK) {
