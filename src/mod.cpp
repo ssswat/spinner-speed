@@ -13,7 +13,7 @@
 //    - Velocidade maxima
 //    - Ganho de velocidade por ataque de serra
 //    - Curva (100 = normal do jogo)
-//    - Link encara o Spinner (metodo 0/1/2/3)
+//    - Link encara o Spinner (metodo 0 a 4)
 //    - Modo motor (liga/desliga) e aceleracao do motor
 //
 //  O mod escreve eventos no log (janela Mods > Spinner Speed > Logs).
@@ -149,8 +149,9 @@ float max_speed() { return static_cast<float>(read_cfg_int(g_varMaxSpeed, kDefau
 // Curva: 100 = igual ao jogo, 300 = 3x mais rapida.
 int turn_percent() { return read_cfg_int(g_varTurn, 300, 100, 800); }
 // Link encara o Spinner: 0 = desligado, 1 = so o modelo, 2 = modelo + direcao,
-// 3 = funcao do proprio jogo (setPlayerPosAndAngle).
-int face_method() { return read_cfg_int(g_varFace, 3, 0, 3); }
+// 3 = funcao do proprio jogo (setPlayerPosAndAngle),
+// 4 = EXPERIMENTAL: escreve tambem nos campos de Link que guardam a direcao inicial.
+int face_method() { return read_cfg_int(g_varFace, 3, 0, 4); }
 // Modo motor: 0 = desligado, 1 = ligado.
 int motor_on() { return read_cfg_int(g_varMotor, 0, 0, 1); }
 // Aceleracao do motor em unidades por SEGUNDO (30 ticks = 1 s).
@@ -179,6 +180,66 @@ bool read_hold_a() {
         return Pad::getHoldA(0) != 0;
     } else {
         return false;
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Busca de campos: o jogo refaz o shape_angle do Link a cada tick a partir de
+//  OUTRA variavel (a direcao em que ele subiu). Varremos o objeto do Link atras
+//  de outros valores de 16 bits iguais ao angulo inicial.
+// ---------------------------------------------------------------------------
+constexpr int kMaxCand = 24;
+std::ptrdiff_t g_candOff[kMaxCand];
+int g_candCount = 0;
+bool g_scanDone = false;
+int16_t g_faceSmooth = 0;        // angulo "suavizado" que queremos mostrar (metodo 4)
+bool g_smoothInit = false;
+int g_candLog = 0;
+
+void scan_link_angles(daAlink_c* link) {
+    g_candCount = 0;
+    const unsigned char* base = reinterpret_cast<const unsigned char*>(link);
+    const int16_t target = link->shape_angle.y;
+    const std::ptrdiff_t offShape = reinterpret_cast<const unsigned char*>(&link->shape_angle.y) - base;
+    const std::ptrdiff_t offCur = reinterpret_cast<const unsigned char*>(&link->current.angle.y) - base;
+    const std::size_t startAt = sizeof(fopAc_ac_c);   // ignora os campos comuns de qualquer ator
+    for (std::size_t off = startAt; off + 2 <= sizeof(daAlink_c); off += 2) {
+        int16_t v;
+        std::memcpy(&v, base + off, 2);
+        if (v == target && static_cast<std::ptrdiff_t>(off) != offShape &&
+            static_cast<std::ptrdiff_t>(off) != offCur && g_candCount < kMaxCand) {
+            g_candOff[g_candCount++] = static_cast<std::ptrdiff_t>(off);
+        }
+    }
+    char buf[320];
+    int n = std::snprintf(buf, sizeof(buf), "FACE-SCAN: valor %d | %d campo(s) iguais no Link (fora shape/current):",
+                          static_cast<int>(target), g_candCount);
+    for (int i = 0; i < g_candCount && n > 0 && n < static_cast<int>(sizeof(buf)) - 12; ++i) {
+        n += std::snprintf(buf + n, sizeof(buf) - n, " +0x%X", static_cast<unsigned>(g_candOff[i]));
+    }
+    svc_log->info(mod_ctx, buf);
+}
+
+void log_candidate_values(daAlink_c* link) {
+    if (g_candCount == 0) return;
+    const unsigned char* base = reinterpret_cast<const unsigned char*>(link);
+    char buf[320];
+    int n = std::snprintf(buf, sizeof(buf), "FACE-CAND:");
+    for (int i = 0; i < g_candCount && n > 0 && n < static_cast<int>(sizeof(buf)) - 20; ++i) {
+        int16_t v;
+        std::memcpy(&v, base + g_candOff[i], 2);
+        n += std::snprintf(buf + n, sizeof(buf) - n, " +0x%X=%d", static_cast<unsigned>(g_candOff[i]), static_cast<int>(v));
+    }
+    svc_log->info(mod_ctx, buf);
+}
+
+// Metodo 4: escreve o angulo suavizado no shape_angle e nos campos candidatos.
+void write_face_candidates(daAlink_c* link) {
+    link->shape_angle.y = g_faceSmooth;
+    unsigned char* base = reinterpret_cast<unsigned char*>(link);
+    for (int i = 0; i < g_candCount; ++i) {
+        const int16_t v = g_faceSmooth;
+        std::memcpy(base + g_candOff[i], &v, 2);
     }
 }
 
@@ -211,6 +272,13 @@ void apply_face(daAlink_c* link, daSpinner_c* spinner) {
                 method, static_cast<int>(link->shape_angle.y), static_cast<int>(link->current.angle.y),
                 static_cast<int>(spinner->current.angle.y), delta);
     }
+    if ((g_candLog++ % 40) == 0) log_candidate_values(link);
+
+    if (method >= 4) {                       // metodo 4: o estado suavizado e atualizado no hook "pre"
+        if (g_smoothInit) write_face_candidates(link);
+        return;
+    }
+
     if (delta == 0) return;
 
     int step = delta * kFacePercentPerTick / 100;
@@ -273,9 +341,32 @@ HookAction on_link_spinner_wait_pre(ModContext*, void* args, void*, void*) {
         g_lastD = 0;
         g_noAssistTicks = 0;
         g_faceHave = false;
+        g_scanDone = false;
+        g_smoothInit = false;
         svc_log->info(mod_ctx, "Novo giro de Spinner: aguardando ativar as serras");
     }
     g_lastWait = now;
+
+    // Varredura (uma vez por giro): procura onde o jogo guarda a direcao inicial do Link.
+    if (!g_scanDone) {
+        g_scanDone = true;
+        scan_link_angles(link);
+    }
+
+    // Metodo 4: atualiza o angulo suavizado e escreve ANTES do jogo refazer o shape_angle.
+    if (face_method() >= 4 && spinner != nullptr && spinner->checkPathMoveNow() == nullptr) {
+        if (!g_smoothInit) {
+            g_faceSmooth = link->shape_angle.y;
+            g_smoothInit = true;
+        }
+        const int d4 = static_cast<int16_t>(spinner->current.angle.y - g_faceSmooth);
+        int st4 = d4 * kFacePercentPerTick / 100;
+        if (st4 == 0 && d4 != 0) st4 = d4 > 0 ? 1 : -1;
+        if (st4 > kFaceMaxStep) st4 = kFaceMaxStep;
+        if (st4 < -kFaceMaxStep) st4 = -kFaceMaxStep;
+        g_faceSmooth = static_cast<int16_t>(g_faceSmooth + st4);
+        write_face_candidates(link);
+    }
 
     // Checagem do proprio jogo: "as serras / o ataque do Spinner foi acionado?"
     const bool attack = link->checkSpinnerTriggerAttack();
@@ -473,12 +564,12 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
 
     UiControlDesc faceCtl = UI_CONTROL_DESC_INIT;
     faceCtl.kind = UI_CONTROL_NUMBER;
-    faceCtl.label = "Link encara o Spinner (0 = desligado, 1, 2, 3)";
-    faceCtl.help_rml = "Faz o Link olhar para onde o Spinner vai. Se um metodo nao funcionar, tente outro: 1 = so o modelo, 2 = modelo e direcao, 3 = funcao do proprio jogo.";
+    faceCtl.label = "Link encara o Spinner (0 = desligado, 1 a 4)";
+    faceCtl.help_rml = "Faz o Link olhar para onde o Spinner vai. Se um metodo nao funcionar, tente outro: 1 = so o modelo, 2 = modelo e direcao, 3 = funcao do proprio jogo, 4 = experimental (escreve nos campos que guardam a direcao inicial).";
     faceCtl.binding = UI_BINDING_CONFIG_VAR;
     faceCtl.config_var = g_varFace;
     faceCtl.min = 0;
-    faceCtl.max = 3;
+    faceCtl.max = 4;
     faceCtl.step = 1;
     svc_ui->pane_add_control(mod_ctx, panel, &faceCtl, nullptr);
 
@@ -525,6 +616,10 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     g_link = nullptr;
     g_faceHave = false;
     g_faceCalls = 0;
+    g_scanDone = false;
+    g_smoothInit = false;
+    g_candCount = 0;
+    g_candLog = 0;
     g_warnedNoGameFn = false;
     g_lastHeld = false;
 
